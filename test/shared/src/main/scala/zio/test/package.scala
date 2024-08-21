@@ -328,24 +328,28 @@ package object test extends CompileVariants {
                    )
                    .intoPromise(promise)
                    .forkDaemon
-        result     <- promise.await
-        _          <- child.inheritAll
-        quotedLabel = "\"" + label + "\""
-        warning =
-          s"Warning: ZIO Test is attempting to interrupt fiber " +
-            s"${child.id} forked in test ${quotedLabel} due to automatic, " +
-            "supervision, but interruption has taken more than 10 " +
-            "seconds to complete. This may indicate a resource leak. " +
-            "Make sure you are not forking a fiber in an " +
-            "uninterruptible region."
-        fiber <- ZIO
-                   .logWarning(warning)
-                   .delay(10.seconds)
-                   .withClock(Clock.ClockLive)
-                   .interruptible
-                   .forkDaemon
-                   .onExecutor(Runtime.defaultExecutor)
-        _ <- (child.interrupt *> fiber.interrupt).forkDaemon.onExecutor(Runtime.defaultExecutor)
+        result <- promise.await
+        _      <- child.inheritAll
+        _ <- ZIO.whenDiscard(child.isAlive()) {
+               for {
+                 fiber <- ZIO
+                            .logWarning({
+                              val quotedLabel = "\"" + label + "\""
+                              s"Warning: ZIO Test is attempting to interrupt fiber " +
+                                s"${child.id} forked in test $quotedLabel due to automatic, " +
+                                "supervision, but interruption has taken more than 10 " +
+                                "seconds to complete. This may indicate a resource leak. " +
+                                "Make sure you are not forking a fiber in an " +
+                                "uninterruptible region."
+                            })
+                            .delay(10.seconds)
+                            .withClock(Clock.ClockLive)
+                            .interruptible
+                            .forkDaemon
+                            .onExecutor(Runtime.defaultExecutor)
+                 _ <- (child.interrupt *> fiber.interrupt).forkDaemon.onExecutor(Runtime.defaultExecutor)
+               } yield ()
+             }
       } yield result
   }
 
@@ -1065,16 +1069,17 @@ package object test extends CompileVariants {
   private def checkStream[R, R1 <: R, E, A](stream: ZStream[R, Nothing, Sample[R, A]])(
     test: A => ZIO[R1, E, TestResult]
   )(implicit trace: Trace): ZIO[R1, E, TestResult] =
-    TestConfig.shrinks.flatMap {
-      shrinkStream {
+    testConfigWith { testConfig =>
+      val flag = Ref.unsafe.make(false)(Unsafe.unsafe)
+      warningEmptyGen(flag) *> shrinkStream {
         stream.zipWithIndex.mapZIO { case (initial, index) =>
-          initial.foreach(input =>
-            test(input)
+          flag.set(true) *> initial.foreach(input =>
+            (test(input) @@ testConfig.checkAspect)
               .map(_.setGenFailureDetails(GenFailureDetails(initial.value, input, index)))
               .either
           )
         }
-      }
+      }(testConfig.shrinks)
     }
 
   private def shrinkStream[R, R1 <: R, E, A](
@@ -1098,12 +1103,12 @@ package object test extends CompileVariants {
   private def checkStreamPar[R, R1 <: R, E, A](stream: ZStream[R, Nothing, Sample[R, A]], parallelism: Int)(
     test: A => ZIO[R1, E, TestResult]
   )(implicit trace: Trace): ZIO[R1, E, TestResult] =
-    TestConfig.shrinks.flatMap {
+    testConfigWith { testConfig =>
       shrinkStream {
         stream.zipWithIndex
           .mapZIOPar(parallelism) { case (initial, index) =>
             initial.foreach { input =>
-              test(input)
+              (test(input) @@ testConfig.checkAspect)
                 .map(_.setGenFailureDetails(GenFailureDetails(initial.value, input, index)))
                 .either
             // convert test failures to failures to terminate parallel tests on first failure
@@ -1111,8 +1116,20 @@ package object test extends CompileVariants {
           // move failures back into success channel for shrinking logic
           }
           .catchAll(ZStream.succeed(_))
-      }
+      }(testConfig.shrinks)
     }
+
+  private def warningEmptyGen(flag: Ref[Boolean])(implicit trace: Trace): UIO[Unit] =
+    Live
+      .live(ZIO.logWarning(warning).unlessZIODiscard(flag.get).delay(5.seconds))
+      .interruptible
+      .fork
+      .onExecutor(Runtime.defaultExecutor)
+      .unit
+
+  private val warning =
+    "Warning: A check / checkAll / checkN generator did not produce any test cases, " +
+      "which may result in the test hanging. Ensure that the provided generator is producing values."
 
   implicit final class TestLensOptionOps[A](private val self: TestLens[Option[A]]) extends AnyVal {
 
